@@ -20,7 +20,7 @@
 import { pktLine, pktFlush, pktDelim, decodePktLines, encodePktLines, writePack, readPack, parseCommit, parseTree, ZERO_OID, hashObject } from './gitobj.ts';
 import type { GitObject } from './gitobj.ts';
 import { Store, VIEWER_LOGIN } from './store.ts';
-import type { Repo, FetchPlan } from './store.ts';
+import type { AdvV0, Repo, FetchPlan } from './store.ts';
 
 export interface GitResult {
   status: number;
@@ -80,6 +80,35 @@ function receivePackCapsV0(repo: Repo): string {
 
 // ---------------------------------------------------------------- info/refs
 
+/**
+ * The ref-set key a cached v0 advertisement was built for: the default branch plus
+ * every ref EXCEPT the default branch (name and oid). A tip change leaves the key
+ * alone, so the cached bytes are patched; any other ref change — a new branch, a
+ * deleted ref, a moved tag — changes the key and rebuilds. Tag targets ride along
+ * because a tag ref's oid is in the key (a moved tag changes it, and its peeled
+ * line is rebuilt with it).
+ */
+function v0RefKey(repo: Repo): string {
+  const main = `refs/heads/${repo.default_branch}`;
+  const others: string[] = [];
+  for (const [name, oid] of repo.refs) {
+    if (name !== main) others.push(`${name}=${oid}`);
+  }
+  others.sort();
+  // The default branch's EXISTENCE is part of the key (its oid is not): an
+  // unborn repo's cached advertisement has no main line at all, so the first
+  // push that creates the branch must rebuild rather than patch.
+  return `${repo.default_branch}|${repo.refs.has(main) ? 'main' : ''}|${others.join(',')}`;
+}
+
+/** A cached v0 advertisement patched with the current tip (on a copy, so a
+ *  response already handed to the socket is never mutated). */
+function patchedV0(cached: AdvV0, tip: string): Buffer {
+  const out = Buffer.from(cached.buf);
+  for (const off of cached.tipOffsets) out.write(tip, off, 'ascii');
+  return out;
+}
+
 export function handleInfoRefs(store: Store, owner: string, name: string, service: 'git-upload-pack' | 'git-receive-pack', gitProtocol: string | null): GitResult {
   const repo = lookupRepo(store, owner, name);
   if (!repo) return notFound();
@@ -101,8 +130,13 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
     }
     return ok(repo.advV2, contentType);
   }
-  if (service === 'git-upload-pack' && repo.advV0Upload !== null) return ok(repo.advV0Upload, contentType);
-  if (service === 'git-receive-pack' && repo.advV0Receive !== null) return ok(repo.advV0Receive, contentType);
+  // v0: patch the cached bytes when the ref set is unchanged, rebuild otherwise.
+  const cached = service === 'git-upload-pack' ? repo.advV0Upload : repo.advV0Receive;
+  const refKey = v0RefKey(repo);
+  if (cached !== null && cached.refKey === refKey) {
+    const tip = store.defaultTip(repo) ?? ZERO_OID;
+    return ok(patchedV0(cached, tip), contentType);
+  }
   const refs = listRefs(store, repo);
   const caps = service === 'git-upload-pack' ? uploadPackCapsV0(repo) : receivePackCapsV0(repo);
   const lines: Array<string | 'flush'> = [`# service=${service}\n`, 'flush'];
@@ -117,8 +151,26 @@ export function handleInfoRefs(store: Store, owner: string, name: string, servic
   }
   lines.push('flush');
   const body = encodePktLines(lines);
-  if (service === 'git-upload-pack') repo.advV0Upload = body;
-  else repo.advV0Receive = body;
+  // Record where the tip OID sits: the HEAD line and the default-branch line are
+  // the only lines a tip change moves. Any other ref at the same commit keeps its
+  // own OID, so it must NOT be patched — match those two lines exactly.
+  const tip = store.defaultTip(repo) ?? ZERO_OID;
+  const tipOffsets: number[] = [];
+  {
+    let off = 0;
+    const branch = repo.default_branch;
+    for (const line of lines) {
+      if (line === 'flush') {
+        off += 4;
+        continue;
+      }
+      if (line.startsWith(`${tip} HEAD\0`) || line === `${tip} refs/heads/${branch}\n`) tipOffsets.push(off + 4);
+      off += 4 + Buffer.byteLength(line, 'utf8');
+    }
+  }
+  const adv: AdvV0 = { buf: body, tipOffsets, refKey };
+  if (service === 'git-upload-pack') repo.advV0Upload = adv;
+  else repo.advV0Receive = adv;
   return ok(body, contentType);
 }
 

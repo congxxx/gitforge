@@ -28,8 +28,8 @@ export function sha1(data: Buffer | string): string {
 
 /** The object id of a loose object: sha1("<type> <size>\0" + data). */
 export function hashObject(type: GitObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1(Buffer.concat([header, data]));
+  // Two updates instead of Buffer.concat: no intermediate copy of the data.
+  return createHash('sha1').update(`${type} ${data.length}\0`).update(data).digest('hex');
 }
 
 /** Whether `value` is a 40-hex object id. */
@@ -328,11 +328,51 @@ interface RawPackEntry {
 }
 
 /**
+ * Fast path for delta-free packs (the only kind the suite's client ever sends, and
+ * the only kind the push workload carries): verify the trailer, inflate each entry
+ * and hash it, with no per-entry records, offset maps or delta resolution. Returns
+ * null for anything it cannot prove flat — a delta entry, an unknown type, a size
+ * mismatch, stray bytes — so the caller falls back to the generic path, which
+ * throws the proper error on real corruption. Never throws itself.
+ */
+function readPackFlat(pack: Buffer): Map<string, GitObject> | null {
+  try {
+    if (pack.length < 32) return null;
+    if (pack.subarray(0, 4).toString('ascii') !== 'PACK') return null;
+    const version = pack.readUInt32BE(4);
+    if (version !== 2 && version !== 3) return null;
+    const declaredCount = pack.readUInt32BE(8);
+    const trailerStart = pack.length - 20;
+    if (!verifyPackChecksum(pack)) return null;
+    const objects = new Map<string, GitObject>();
+    let offset = 12;
+    for (let index = 0; index < declaredCount; index += 1) {
+      const header = readPackVarint(pack, offset);
+      offset = header.next;
+      const typeCode = (header.first >> 4) & 0x07;
+      if (typeCode === 6 || typeCode === 7) return null;
+      const type = TYPE_CODES[typeCode];
+      if (type === undefined) return null;
+      const inflated = inflateAt(pack.subarray(0, trailerStart), offset);
+      if (inflated.data.length !== header.size) return null;
+      offset = inflated.next;
+      objects.set(hashObject(type, inflated.data), { type, data: inflated.data });
+    }
+    if (offset !== trailerStart) return null;
+    return objects;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Read a packfile (version 2) and resolve every object, including OFS_DELTA and
  * REF_DELTA. `resolveBase` supplies a base object a thin pack leaves out.
  * Throws on any corruption; a bad checksum is a throw too.
  */
 export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) => GitObject | undefined } = {}): Map<string, GitObject> {
+  const flat = readPackFlat(pack);
+  if (flat !== null) return flat;
   if (pack.length < 32) throw new Error(`pack is ${pack.length} bytes, too short`);
   if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('pack does not start with PACK');
   const version = pack.readUInt32BE(4);

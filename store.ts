@@ -130,12 +130,23 @@ export interface Repo {
   nextPullNumber: number;
   /** Cached fetch plans keyed by the pack request fingerprint. */
   packCache: Map<string, FetchPlan>;
-  /** Cached info/refs advertisement bytes; cleared whenever refs change. */
+  /** Cached info/refs advertisements; the v0 ones carry the tip-OID offsets so a
+   *  tip change patches a copy instead of rebuilding (see githttp.ts). The v2
+   *  advertisement holds capabilities only and never depends on refs. */
   advV2: Buffer | null;
-  advV0Upload: Buffer | null;
-  advV0Receive: Buffer | null;
+  advV0Upload: AdvV0 | null;
+  advV0Receive: AdvV0 | null;
   /** Cached ls-refs responses keyed by the argument signature. */
   lsRefsCache: Map<string, Buffer>;
+}
+
+/** A cached v0 advertisement: bytes, the byte offsets of the tip OID inside them
+ *  (the HEAD line and the default-branch line — the only lines a tip change moves),
+ *  and the ref-set key they were built for. */
+export interface AdvV0 {
+  buf: Buffer;
+  tipOffsets: number[];
+  refKey: string;
 }
 
 /** Opaque global ids: base64url of a typed payload, never the bare numeric id. */
@@ -239,12 +250,12 @@ export class Store {
     return out;
   }
 
-  /** Invalidate every cache that depends on the repo's refs (packs, advertisements). */
+  /** Invalidate every cache that depends on the repo's refs. The v0 advertisements
+   *  are NOT cleared: their ref-set key (githttp.ts) detects a structural ref
+   *  change and rebuilds, while a plain tip change patches the cached bytes in a
+   *  copy. The v2 advertisement holds capabilities only and never depends on refs. */
   bumpRefs(repo: Repo): void {
     repo.packCache.clear();
-    repo.advV2 = null;
-    repo.advV0Upload = null;
-    repo.advV0Receive = null;
     repo.lsRefsCache.clear();
   }
 
