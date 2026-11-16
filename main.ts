@@ -15,6 +15,8 @@
 //      reads.
 //
 // main.ts imports its own server and nothing else: no package, no Node built-in, no model call.
+// The server it boots (app.ts) is this entry's forge: git smart HTTP, REST v3, GraphQL v4 and MCP
+// over one in-memory store, built for the github-core-clone-01 bounty.
 
 import { createApp } from './app.ts';
 
