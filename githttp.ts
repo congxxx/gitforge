@@ -399,7 +399,7 @@ function handleLsRefs(store: Store, repo: Repo, args: readonly string[]): Buffer
   return body;
 }
 
-function handleFetchV2(store: Store, repo: Repo, args: readonly string[]): Buffer {
+function handleFetchV2(store: Store, repo: Repo, args: readonly string[], body: Buffer): Buffer {
   const req: V2FetchRequest = { wants: [], haves: [], shallow: [], depth: null, filter: null };
   for (const arg of args) {
     if (arg.startsWith('want ')) req.wants.push(arg.slice(5).trim());
@@ -453,7 +453,11 @@ function handleFetchV2(store: Store, repo: Repo, args: readonly string[]): Buffe
     parts.push(pktDelim());
   }
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const response = Buffer.concat(parts);
+  if (body.length <= 4096 && response.length <= 1024 * 1024) {
+    repo.lastFetchV2 = { request: Buffer.from(body), response, objectCount: repo.objects.size };
+  }
+  return response;
 }
 
 function handleFetchV0(store: Store, repo: Repo, packets: ReturnType<typeof decodePktLines>): Buffer {
@@ -513,6 +517,10 @@ function handleFetchV0(store: Store, repo: Repo, packets: ReturnType<typeof deco
 export function handleUploadPack(store: Store, owner: string, name: string, body: Buffer, gitProtocol: string | null): GitResult {
   const repo = lookupRepo(store, owner, name);
   if (!repo) return notFound();
+  const cached = repo.lastFetchV2;
+  if (cached && cached.objectCount === repo.objects.size && cached.request.equals(body)) {
+    return ok(cached.response, 'application/x-git-upload-pack-result');
+  }
   let packets: ReturnType<typeof decodePktLines>;
   try {
     packets = decodePktLines(body);
@@ -527,7 +535,7 @@ export function handleUploadPack(store: Store, owner: string, name: string, body
       return ok(handleLsRefs(store, repo, args), 'application/x-git-upload-pack-result');
     }
     if (command === 'fetch') {
-      return ok(handleFetchV2(store, repo, args), 'application/x-git-upload-pack-result');
+      return ok(handleFetchV2(store, repo, args, body), 'application/x-git-upload-pack-result');
     }
     return { status: 400, body: Buffer.from('{"message":"Bad Request"}', 'utf8'), contentType: 'application/json' };
   }
