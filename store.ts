@@ -129,6 +129,7 @@ export interface Repo {
   pulls: Map<number, PullRequest>;
   nextPullNumber: number;
   /** Cached fetch plans keyed by the pack request fingerprint. */
+  lastFetchV2: { request: Buffer; response: Buffer; objectCount: number } | null;
   packCache: Map<string, FetchPlan>;
   /** Cached info/refs advertisements; the v0 ones carry the tip-OID offsets so a
    *  tip change patches a copy instead of rebuilding (see githttp.ts). The v2
@@ -220,6 +221,7 @@ export class Store {
       nextLabelId: 1,
       pulls: new Map(),
       nextPullNumber: 1,
+      lastFetchV2: null,
       packCache: new Map(),
       advV2: null,
       advV0Upload: null,
@@ -255,6 +257,7 @@ export class Store {
    *  change and rebuilds, while a plain tip change patches the cached bytes in a
    *  copy. The v2 advertisement holds capabilities only and never depends on refs. */
   bumpRefs(repo: Repo): void {
+    repo.lastFetchV2 = null;
     repo.packCache.clear();
     repo.lsRefsCache.clear();
   }
